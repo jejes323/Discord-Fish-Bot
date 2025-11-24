@@ -10,6 +10,7 @@
   "description": "",
   "dependencies": {
     "@discordjs/builders": "^1.10.1",
+    "better-sqlite3": "^12.4.6",
     "discord.js": "^14.18.0"
   }
 }
