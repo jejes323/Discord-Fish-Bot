@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const { SlashCommandBuilder } = require('@discordjs/builders');
 const Database = require('better-sqlite3');
 
@@ -25,7 +25,92 @@ db.exec(`
   )
 `);
 
+// 사용자 테이블 생성
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    balance INTEGER DEFAULT 0,
+    fishing_count INTEGER DEFAULT 0,
+    fishing_rod TEXT DEFAULT '나뭇가지',
+    inventory TEXT DEFAULT '[]'
+  )
+`);
+
+// 인벤토리 테이블 생성
+db.exec(`
+  CREATE TABLE IF NOT EXISTS inventory (
+    user_id TEXT NOT NULL,
+    fish_id INTEGER NOT NULL,
+    count INTEGER DEFAULT 1,
+    PRIMARY KEY (user_id, fish_id),
+    FOREIGN KEY (fish_id) REFERENCES fish(id)
+  )
+`);
+
 console.log('데이터베이스가 초기화되었습니다.');
+
+// 사용자 데이터 조회 또는 생성
+function getUserData(userId) {
+  let user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+
+  if (!user) {
+    // 사용자가 없으면 새로 생성
+    db.prepare(`
+      INSERT INTO users (user_id, balance, fishing_count, fishing_rod, inventory)
+      VALUES (?, 0, 0, '나뭇가지', '[]')
+    `).run(userId);
+
+    user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+  }
+
+  return user;
+}
+
+// 낚시 횟수 업데이트
+function updateFishingCount(userId) {
+  db.prepare('UPDATE users SET fishing_count = fishing_count + 1 WHERE user_id = ?').run(userId);
+}
+
+// 인벤토리의 총 물고기 개수 조회
+function getTotalFishCount(userId) {
+  const result = db.prepare('SELECT SUM(count) as total FROM inventory WHERE user_id = ?').get(userId);
+  return result.total || 0;
+}
+
+// 인벤토리에 물고기 추가
+function addFishToInventory(userId, fishId) {
+  // 현재 총 개수 확인
+  const totalCount = getTotalFishCount(userId);
+
+  if (totalCount >= 20) {
+    return false; // 인벤토리가 가득 참
+  }
+
+  // 같은 물고기가 있는지 확인
+  const existing = db.prepare('SELECT * FROM inventory WHERE user_id = ? AND fish_id = ?').get(userId, fishId);
+
+  if (existing) {
+    // 이미 있으면 개수 증가
+    db.prepare('UPDATE inventory SET count = count + 1 WHERE user_id = ? AND fish_id = ?').run(userId, fishId);
+  } else {
+    // 없으면 새로 추가
+    db.prepare('INSERT INTO inventory (user_id, fish_id, count) VALUES (?, ?, 1)').run(userId, fishId);
+  }
+
+  return true;
+}
+
+// 사용자가 보유한 등급 목록 조회
+function getUserRarities(userId) {
+  const rarities = db.prepare(`
+    SELECT DISTINCT f.rarity
+    FROM inventory i
+    JOIN fish f ON i.fish_id = f.id
+    WHERE i.user_id = ?
+  `).all(userId);
+
+  return rarities.map(r => r.rarity);
+}
 
 // 등급별 확률로 랜덤 선택
 function getRandomRarity() {
@@ -321,6 +406,23 @@ client.on('interactionCreate', async (interaction) => {
                 .setTimestamp();
 
               await user.send({ embeds: [resultEmbed] });
+
+              // 낚시 횟수 업데이트
+              updateFishingCount(userId);
+
+              // 인벤토리에 물고기 추가
+              const added = addFishToInventory(userId, selectedFish.id);
+
+              if (!added) {
+                // 인벤토리가 가득 찬 경우
+                const fullInventoryEmbed = new EmbedBuilder()
+                  .setColor('#FF0000')
+                  .setTitle('⚠️ 인벤토리 가득 참')
+                  .setDescription('인벤토리가 가득 차서 물고기를 저장할 수 없습니다! (최대 20마리)')
+                  .setTimestamp();
+
+                await user.send({ embeds: [fullInventoryEmbed] });
+              }
             } else {
               // 해당 등급의 물고기가 없을 경우
               const noFishEmbed = new EmbedBuilder()
@@ -343,11 +445,216 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: '💰 상점 버튼을 클릭했습니다!', ephemeral: true });
         break;
       case 'inventory':
-        await interaction.reply({ content: '💼 인벤토리 버튼을 클릭했습니다!', ephemeral: true });
+        const inventoryUserId = interaction.user.id;
+
+        // 보유한 등급 조회
+        const userRarities = getUserRarities(inventoryUserId);
+
+        if (userRarities.length === 0) {
+          const emptyEmbed = new EmbedBuilder()
+            .setColor('#9B59B6')
+            .setTitle('💼 인벤토리')
+            .setDescription('인벤토리가 비어있습니다. 낚시를 해보세요!')
+            .setTimestamp();
+
+          await interaction.reply({ embeds: [emptyEmbed], ephemeral: true });
+          break;
+        }
+
+        // 등급별 버튼 생성 (보유한 등급만)
+        const rarityButtons = [];
+        const rarityConfig = {
+          '일반': { customId: 'inventory_common', emoji: '⚪', style: ButtonStyle.Secondary },
+          '레어': { customId: 'inventory_rare', emoji: '🔵', style: ButtonStyle.Primary },
+          '에픽': { customId: 'inventory_epic', emoji: '🟣', style: ButtonStyle.Primary },
+          '전설': { customId: 'inventory_legendary', emoji: '🟠', style: ButtonStyle.Danger },
+          '신화': { customId: 'inventory_mythic', emoji: '🟡', style: ButtonStyle.Success }
+        };
+
+        // 등급 순서대로 버튼 추가
+        const rarityOrder = ['신화', '전설', '에픽', '레어', '일반'];
+        rarityOrder.forEach(rarity => {
+          if (userRarities.includes(rarity)) {
+            const config = rarityConfig[rarity];
+            rarityButtons.push(
+              new ButtonBuilder()
+                .setCustomId(config.customId)
+                .setLabel(rarity)
+                .setEmoji(config.emoji)
+                .setStyle(config.style)
+            );
+          }
+        });
+
+        // 버튼을 ActionRow에 추가 (최대 5개)
+        const row = new ActionRowBuilder().addComponents(rarityButtons);
+
+        const totalCount = getTotalFishCount(inventoryUserId);
+
+        const selectEmbed = new EmbedBuilder()
+          .setColor('#9B59B6')
+          .setTitle('💼 인벤토리')
+          .setDescription('등급을 선택하세요!')
+          .setFooter({ text: `총 보유: ${totalCount}/20마리` })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [selectEmbed], components: [row], ephemeral: true });
+        break;
+
+      // 등급별 인벤토리 조회 - 드롭다운 메뉴 생성
+      case 'inventory_common':
+      case 'inventory_rare':
+      case 'inventory_epic':
+      case 'inventory_legendary':
+      case 'inventory_mythic':
+        const filterUserId = interaction.user.id;
+
+        // customId에서 등급 추출
+        const rarityMap = {
+          'inventory_common': '일반',
+          'inventory_rare': '레어',
+          'inventory_epic': '에픽',
+          'inventory_legendary': '전설',
+          'inventory_mythic': '신화'
+        };
+        const selectedRarity = rarityMap[interaction.customId];
+
+        // 선택한 등급의 물고기 조회
+        const filteredItems = db.prepare(`
+          SELECT f.id, f.name, f.rarity, f.price, i.count
+          FROM inventory i
+          JOIN fish f ON i.fish_id = f.id
+          WHERE i.user_id = ? AND f.rarity = ?
+          ORDER BY f.name ASC
+        `).all(filterUserId, selectedRarity);
+
+        if (filteredItems.length === 0) {
+          const emptyRarityEmbed = new EmbedBuilder()
+            .setColor('#9B59B6')
+            .setTitle(`💼 인벤토리 - ${selectedRarity}`)
+            .setDescription('해당 등급의 물고기가 없습니다.')
+            .setTimestamp();
+
+          await interaction.reply({ embeds: [emptyRarityEmbed], ephemeral: true });
+          break;
+        }
+
+        const rarityEmojiMap = {
+          '일반': '⚪',
+          '레어': '🔵',
+          '에픽': '🟣',
+          '전설': '🟠',
+          '신화': '🟡'
+        };
+
+        const rarityColorMap = {
+          '일반': '#808080',
+          '레어': '#0080FF',
+          '에픽': '#A020F0',
+          '전설': '#FF8C00',
+          '신화': '#FFD700'
+        };
+
+        // 드롭다운 메뉴 생성
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('fish_select')
+          .setPlaceholder('물고기를 선택하세요');
+
+        // 물고기 옵션 추가 (최대 25개)
+        filteredItems.slice(0, 25).forEach(item => {
+          const emoji = rarityEmojiMap[item.rarity] || '⚪';
+          selectMenu.addOptions(
+            new StringSelectMenuOptionBuilder()
+              .setLabel(item.name)
+              .setDescription(`개수: ${item.count}마리 | 가격: ${item.price}원`)
+              .setValue(`${item.id}`)
+              .setEmoji(emoji)
+          );
+        });
+
+        const selectRow = new ActionRowBuilder().addComponents(selectMenu);
+
+        let totalFilteredCount = 0;
+        filteredItems.forEach(item => {
+          totalFilteredCount += item.count;
+        });
+
+        const dropdownEmbed = new EmbedBuilder()
+          .setColor(rarityColorMap[selectedRarity])
+          .setTitle(`💼 인벤토리 - ${selectedRarity}`)
+          .setDescription('아래에서 물고기를 선택하여 상세 정보를 확인하세요.')
+          .setFooter({ text: `${selectedRarity} 등급: ${totalFilteredCount}마리` })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [dropdownEmbed], components: [selectRow], ephemeral: true });
         break;
       case 'profile':
-        await interaction.reply({ content: '👤 내정보 버튼을 클릭했습니다!', ephemeral: true });
+        const profileUserId = interaction.user.id;
+        const userData = getUserData(profileUserId);
+
+        const profileEmbed = new EmbedBuilder()
+          .setColor('#5865F2')
+          .setTitle('👤 내정보')
+          .setDescription(`<@${profileUserId}>님의 정보입니다.`)
+          .addFields(
+            { name: '🆔 사용자 ID', value: profileUserId, inline: false },
+            { name: '💰 보유금', value: `${userData.balance}원`, inline: true },
+            { name: '🎣 낚시횟수', value: `${userData.fishing_count}회`, inline: true },
+            { name: '🎣 낚싯대 등급', value: userData.fishing_rod, inline: true }
+          )
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [profileEmbed], ephemeral: true });
         break;
+    }
+  }
+
+  // 드롭다운 메뉴 선택 처리
+  if (interaction.isStringSelectMenu()) {
+    if (interaction.customId === 'fish_select') {
+      const fishId = parseInt(interaction.values[0]);
+      const userId = interaction.user.id;
+
+      // 선택한 물고기 정보 조회
+      const fishInfo = db.prepare(`
+        SELECT f.id, f.name, f.rarity, f.price, i.count
+        FROM inventory i
+        JOIN fish f ON i.fish_id = f.id
+        WHERE i.user_id = ? AND f.id = ?
+      `).get(userId, fishId);
+
+      if (!fishInfo) {
+        await interaction.reply({ content: '물고기 정보를 찾을 수 없습니다.', ephemeral: true });
+        return;
+      }
+
+      const rarityColorMap = {
+        '일반': '#808080',
+        '레어': '#0080FF',
+        '에픽': '#A020F0',
+        '전설': '#FF8C00',
+        '신화': '#FFD700'
+      };
+
+      const rarityEmojiMap = {
+        '일반': '⚪',
+        '레어': '🔵',
+        '에픽': '🟣',
+        '전설': '🟠',
+        '신화': '🟡'
+      };
+
+      const fishDetailEmbed = new EmbedBuilder()
+        .setColor(rarityColorMap[fishInfo.rarity])
+        .setTitle(`${rarityEmojiMap[fishInfo.rarity]} ${fishInfo.name}`)
+        .setDescription(`**등급**: ${fishInfo.rarity}`)
+        .addFields(
+          { name: '💰 가격', value: `${fishInfo.price}원`, inline: true },
+          { name: '📦 보유 개수', value: `${fishInfo.count}마리`, inline: true }
+        )
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [fishDetailEmbed], ephemeral: true });
     }
   }
 });
