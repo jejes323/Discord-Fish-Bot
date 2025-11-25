@@ -112,6 +112,38 @@ function getUserRarities(userId) {
   return rarities.map(r => r.rarity);
 }
 
+// 모든 물고기 판매
+function sellAllFish(userId) {
+  // 인벤토리의 모든 물고기 조회
+  const allFish = db.prepare(`
+    SELECT f.id, f.name, f.rarity, f.price, i.count
+    FROM inventory i
+    JOIN fish f ON i.fish_id = f.id
+    WHERE i.user_id = ?
+  `).all(userId);
+
+  if (allFish.length === 0) {
+    return null; // 판매할 물고기 없음
+  }
+
+  // 총 판매 금액 계산
+  let totalPrice = 0;
+  allFish.forEach(fish => {
+    totalPrice += fish.price * fish.count;
+  });
+
+  // 보유금 업데이트
+  db.prepare('UPDATE users SET balance = balance + ? WHERE user_id = ?').run(totalPrice, userId);
+
+  // 인벤토리 전체 삭제
+  db.prepare('DELETE FROM inventory WHERE user_id = ?').run(userId);
+
+  return {
+    soldFish: allFish,
+    totalPrice: totalPrice
+  };
+}
+
 // 등급별 확률로 랜덤 선택
 function getRandomRarity() {
   const rand = Math.random() * 100;
@@ -442,7 +474,27 @@ client.on('interactionCreate', async (interaction) => {
         }, 60000); // 60,000ms = 1분
         break;
       case 'shop':
-        await interaction.reply({ content: '💰 상점 버튼을 클릭했습니다!', ephemeral: true });
+        const shopEmbed = new EmbedBuilder()
+          .setColor('#FFD700')
+          .setTitle('💰 상점')
+          .setDescription('원하는 기능을 선택하세요!')
+          .setTimestamp();
+
+        const sellButton = new ButtonBuilder()
+          .setCustomId('shop_sell')
+          .setLabel('판매')
+          .setEmoji('💰')
+          .setStyle(ButtonStyle.Success);
+
+        const upgradeButton = new ButtonBuilder()
+          .setCustomId('shop_upgrade')
+          .setLabel('업그레이드')
+          .setEmoji('⬆️')
+          .setStyle(ButtonStyle.Primary);
+
+        const shopRow = new ActionRowBuilder().addComponents(sellButton, upgradeButton);
+
+        await interaction.reply({ embeds: [shopEmbed], components: [shopRow], ephemeral: true });
         break;
       case 'inventory':
         const inventoryUserId = interaction.user.id;
@@ -605,6 +657,66 @@ client.on('interactionCreate', async (interaction) => {
           .setTimestamp();
 
         await interaction.reply({ embeds: [profileEmbed], ephemeral: true });
+        break;
+
+      // 상점 - 판매
+      case 'shop_sell':
+        const sellUserId = interaction.user.id;
+
+        const sellResult = sellAllFish(sellUserId);
+
+        if (!sellResult) {
+          const emptyInventoryEmbed = new EmbedBuilder()
+            .setColor('#FFA500')
+            .setTitle('💰 판매')
+            .setDescription('인벤토리가 비어있습니다. 판매할 물고기가 없습니다.')
+            .setTimestamp();
+
+          await interaction.reply({ embeds: [emptyInventoryEmbed], ephemeral: true });
+          break;
+        }
+
+        // 판매된 물고기 목록 생성
+        let sellDescription = '모든 물고기를 판매했습니다!\n\n';
+        const rarityEmojiForSell = {
+          '일반': '⚪',
+          '레어': '🔵',
+          '에픽': '🟣',
+          '전설': '🟠',
+          '신화': '🟡'
+        };
+
+        sellResult.soldFish.forEach(fish => {
+          const emoji = rarityEmojiForSell[fish.rarity] || '⚪';
+          sellDescription += `${emoji} **${fish.name}** [${fish.rarity}]\n`;
+          sellDescription += `   ${fish.count}마리 × ${fish.price}원 = ${fish.count * fish.price}원\n\n`;
+        });
+
+        // 업데이트된 보유금 조회
+        const updatedUser = getUserData(sellUserId);
+
+        const sellEmbed = new EmbedBuilder()
+          .setColor('#00FF00')
+          .setTitle('💰 판매 완료')
+          .setDescription(sellDescription)
+          .addFields(
+            { name: '💵 총 판매 금액', value: `${sellResult.totalPrice}원`, inline: true },
+            { name: '💰 현재 보유금', value: `${updatedUser.balance}원`, inline: true }
+          )
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [sellEmbed], ephemeral: true });
+        break;
+
+      // 상점 - 업그레이드
+      case 'shop_upgrade':
+        const upgradeEmbed = new EmbedBuilder()
+          .setColor('#5865F2')
+          .setTitle('⬆️ 업그레이드')
+          .setDescription('업그레이드 기능은 곧 추가될 예정입니다!')
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [upgradeEmbed], ephemeral: true });
         break;
     }
   }
